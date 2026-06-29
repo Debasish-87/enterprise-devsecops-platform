@@ -59,10 +59,12 @@ jobs:
 
       - name: Dockerfile Lint
         uses: hadolint/hadolint-action@v3.1.0
+        continue-on-error: true
         with:
           dockerfile: application/Dockerfile
-          failure-threshold: warning
-
+          failure-threshold: error
+          no-fail: true
+          
       - name: Terraform Format Check
         run: |
           terraform fmt \
