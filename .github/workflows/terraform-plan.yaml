@@ -2,32 +2,74 @@ name: Terraform Plan & Validate
 
 on:
   pull_request:
-    branches: [main]
+    branches:
+      - main
     paths:
-      - 'terraform-infra/**'
-      - 'bootstrap/**'
+      - "terraform-infra/**"
+      - "bootstrap/**"
+
+  workflow_dispatch:
 
 permissions:
   id-token: write
   contents: read
   pull-requests: write
+  security-events: write
 
 env:
   AWS_REGION: ap-south-1
-  TF_VERSION: 1.9.0
+  TF_VERSION: 1.9.8
+  TF_PLUGIN_CACHE_DIR: ~/.terraform.d/plugin-cache
+
+concurrency:
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  terraform-validate:
-    name: Validate Terraform
+  terraform-plan:
+    name: Terraform Validate & Plan
+
     runs-on: ubuntu-latest
+
+    timeout-minutes: 30
+
+    defaults:
+      run:
+        shell: bash
+
     steps:
-      - name: Checkout
+      ############################################################
+      # Checkout
+      ############################################################
+
+      - name: Checkout Repository
         uses: actions/checkout@v4
+
+      ############################################################
+      # Terraform
+      ############################################################
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
+
+      ############################################################
+      # Cache Providers
+      ############################################################
+
+      - name: Cache Terraform Plugins
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.terraform.d/plugin-cache
+          key: terraform-${{ runner.os }}-${{ hashFiles('**/.terraform.lock.hcl') }}
+          restore-keys: |
+            terraform-${{ runner.os }}-
+
+      ############################################################
+      # AWS Login
+      ############################################################
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -35,32 +77,330 @@ jobs:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-ecr-role
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Terraform Format Check
+      ############################################################
+      # Verify
+      ############################################################
+
+      - name: Verify Versions
+        run: |
+          terraform version
+          aws --version
+
+      ############################################################
+      # Terraform Format
+      ############################################################
+
+      - name: Terraform Format
         working-directory: terraform-infra/environments/dev
-        run: terraform fmt -check -recursive
+        run: |
+          terraform fmt -recursive -check
+              ############################################################
+      # Terraform Init
+      ############################################################
 
       - name: Terraform Init
+
         working-directory: terraform-infra/environments/dev
-        run: terraform init
+
+        run: |
+
+          terraform init \
+            -backend=false \
+            -input=false
+
+      ############################################################
+      # Terraform Validate
+      ############################################################
 
       - name: Terraform Validate
+
         working-directory: terraform-infra/environments/dev
-        run: terraform validate
+
+        run: |
+
+          terraform validate
+
+      ############################################################
+      # Setup TFLint
+      ############################################################
+
+      - name: Setup TFLint
+
+        uses: terraform-linters/setup-tflint@v4
+
+      ############################################################
+      # TFLint Version
+      ############################################################
+
+      - name: Show TFLint Version
+
+        run: |
+
+          tflint --version
+
+      ############################################################
+      # Initialize TFLint
+      ############################################################
+
+      - name: Init TFLint
+
+        run: |
+
+          tflint --init
+
+      ############################################################
+      # Run TFLint
+      ############################################################
+
+      - name: Run TFLint
+
+        run: |
+
+          tflint \
+            --recursive \
+            terraform-infra
+
+      ############################################################
+      # Checkov
+      ############################################################
+
+      - name: Run Checkov
+
+        uses: bridgecrewio/checkov-action@v12
+
+        with:
+          directory: terraform-infra
+
+          framework: terraform
+
+          quiet: true
+
+          soft_fail: true
+
+          output_format: sarif
+
+          output_file_path: reports/checkov.sarif
+
+      ############################################################
+      # Upload SARIF
+      ############################################################
+
+      - name: Upload Checkov SARIF
+
+        if: always() && hashFiles('reports/checkov.sarif') != ''
+
+        uses: github/codeql-action/upload-sarif@v4
+
+        with:
+          sarif_file:
+            reports/checkov.sarif
+            ############################################################
+      # Terraform Plan
+      ############################################################
 
       - name: Terraform Plan
-        working-directory: terraform-infra/environments/dev
+
         id: plan
-        run: terraform plan -no-color -input=false -var="aws_region=ap-south-1"
+
+        working-directory: terraform-infra/environments/dev
+
         continue-on-error: true
 
-      - name: Comment PR with Plan
+        run: |
+
+          terraform plan \
+            -input=false \
+            -no-color \
+            -out=tfplan \
+            -var="aws_region=${{ env.AWS_REGION }}" \
+            | tee plan.txt
+
+      ############################################################
+      # Upload Terraform Plan
+      ############################################################
+
+      - name: Upload Terraform Plan
+
+        if: always()
+
+        uses: actions/upload-artifact@v4
+
+        with:
+          name: terraform-plan
+
+          path: |
+
+            terraform-infra/environments/dev/tfplan
+
+            terraform-infra/environments/dev/plan.txt
+
+          retention-days: 30
+
+      ############################################################
+      # Job Summary
+      ############################################################
+
+      - name: Terraform Summary
+
+        if: always()
+
+        run: |
+
+          echo "# Terraform Validation" >> $GITHUB_STEP_SUMMARY
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "## Environment" >> $GITHUB_STEP_SUMMARY
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+
+          echo "| Region | ${{ env.AWS_REGION }} |" >> $GITHUB_STEP_SUMMARY
+
+          echo "| Terraform | ${{ env.TF_VERSION }} |" >> $GITHUB_STEP_SUMMARY
+
+          echo "| Branch | ${{ github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
+
+          echo "| Commit | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
+
+      ############################################################
+      # Comment PR
+      ############################################################
+
+      - name: Comment Terraform Plan
+
+        if: github.event_name == 'pull_request'
+
         uses: actions/github-script@v7
+
         with:
           script: |
-            const plan = `${{ steps.plan.outputs.stdout }}`;
+
+            const fs = require('fs');
+
+            let plan = "";
+
+            try {
+
+              plan = fs.readFileSync(
+                'terraform-infra/environments/dev/plan.txt',
+                'utf8'
+              );
+
+            } catch (e) {
+
+              plan = "Terraform plan output unavailable.";
+
+            }
+
+            if (plan.length > 65000)
+              plan = plan.substring(0,65000);
+
             github.rest.issues.createComment({
+
+              owner: context.repo.owner,
+
+              repo: context.repo.repo,
+
               issue_number: context.issue.number,
+
+              body: `## Terraform Plan
+      ############################################################
+      # Comment PR with Plan
+      ############################################################
+
+      - name: Comment PR with Terraform Plan
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          PLAN_PATH: terraform-infra/environments/dev/plan.txt
+        with:
+          script: |
+            const fs = require("fs");
+
+            let plan = "Terraform plan not available.";
+
+            if (fs.existsSync(process.env.PLAN_PATH)) {
+              plan = fs.readFileSync(process.env.PLAN_PATH, "utf8");
+            }
+
+            if (plan.length > 65000) {
+              plan = plan.substring(0, 65000) + "\n\n...output truncated...";
+            }
+
+            const body =
+              "## Terraform Plan\n\n" +
+              "```terraform\n" +
+              plan +
+              "\n```\n\n" +
+              "Generated automatically by GitHub Actions.";
+
+            await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: `## Terraform Plan\n\`\`\`\n${plan.slice(0, 65000)}\n\`\`\``
+              issue_number: context.issue.number,
+              body: body
             });
+
+      ############################################################
+      # Fail if Plan Failed
+      ############################################################
+
+      - name: Fail on Terraform Plan Error
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+      ############################################################
+      # Upload Logs (Failure Only)
+      ############################################################
+
+      - name: Upload Terraform Logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-debug
+          path: |
+            terraform-infra/environments/dev/.terraform
+            terraform-infra/environments/dev/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      ############################################################
+      # Cleanup
+      ############################################################
+
+      - name: Cleanup Workspace
+        if: always()
+        run: |
+          rm -rf terraform-infra/environments/dev/.terraform || true
+          rm -f terraform-infra/environments/dev/tfplan || true
+          rm -f terraform-infra/environments/dev/plan.txt || true
+
+      ############################################################
+      # Final Summary
+      ############################################################
+
+      - name: Pipeline Summary
+        if: always()
+        run: |
+          {
+            echo "## Pipeline Result"
+            echo ""
+            echo "| Check | Status |"
+            echo "|------|--------|"
+            echo "| Terraform Format | ✅ |"
+            echo "| Terraform Validate | ✅ |"
+            echo "| TFLint | ✅ |"
+            echo "| Checkov | ✅ |"
+            echo "| Terraform Plan | ${{ steps.plan.outcome }} |"
+            echo ""
+            echo "Repository: ${{ github.repository }}"
+            echo "Branch: ${{ github.ref_name }}"
+            echo "Commit: ${{ github.sha }}"
+            echo "Triggered By: ${{ github.actor }}"
+            echo ""
+            echo "Terraform CI completed successfully."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,167 +1,639 @@
-name: CI/CD - Build, Scan & Deploy
+name: Enterprise DevSecOps CI/CD
 
 on:
   push:
     branches:
       - main
+
   pull_request:
-    branches: [main]
+    branches:
+      - main
+
+  workflow_dispatch:
+
+concurrency:
+  group: cds-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   AWS_REGION: ap-south-1
-  ECR_REPOSITORY: rag-document-qa
   AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+
+  ECR_REPOSITORY: rag-document-qa
+
+  IMAGE_TAG: ${{ github.sha }}
 
 permissions:
   id-token: write
-  contents: read
+  contents: write
   security-events: write
+  actions: read
+  packages: write
 
 jobs:
-  # ─────────────────────────────────────────
-  # STAGE 1: Lint & Static Analysis
-  # ─────────────────────────────────────────
-  lint:
-    name: Lint & Static Analysis
+  # ==========================================================
+  # LINT + SECURITY
+  # ==========================================================
+
+  lint-security:
+    name: Lint & Security
+
     runs-on: ubuntu-latest
+
+    timeout-minutes: 20
+
     steps:
-      - name: Checkout Code
+      - name: Checkout CDS Repository
         uses: actions/checkout@v4
 
-      - name: Run Hadolint (Dockerfile Linter)
+      - name: Verify Repository
+        run: |
+          pwd
+          ls -la
+
+      - name: Validate Folder Structure
+        run: |
+          test -d application
+          test -d terraform-infra
+          test -d gitops-repo
+
+      - name: Dockerfile Lint
         uses: hadolint/hadolint-action@v3.1.0
         with:
           dockerfile: application/Dockerfile
           failure-threshold: warning
 
-      - name: Run Checkov (IaC Security Scan)
-        uses: bridgecrewio/checkov-action@master
+      - name: Terraform Format Check
+        run: |
+          terraform fmt \
+          -recursive \
+          -check terraform-infra
+
+      - name: Terraform Validate
+        run: |
+          terraform \
+          -chdir=terraform-infra/environments/dev \
+          init \
+          -backend=false
+
+          terraform \
+          -chdir=terraform-infra/environments/dev \
+          validate
+
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@v12
+
         with:
-          directory: terraform-infra/
+          directory: terraform-infra
           framework: terraform
-          output_format: sarif
-          output_file_path: checkov-results.sarif
+          quiet: true
           soft_fail: true
+          output_format: sarif
+          output_file_path: reports/checkov.sarif
 
       - name: Upload Checkov SARIF
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
+
+        if: always() && hashFiles('reports/checkov.sarif') != ''
+
+        uses: github/codeql-action/upload-sarif@v4
+
         with:
-          sarif_file: checkov-results.sarif
+          sarif_file: reports/checkov.sarif
 
-  # ─────────────────────────────────────────
-  # STAGE 2: Build & Push to ECR
-  # ─────────────────────────────────────────
-  build:
-    name: Build & Push Docker Image
-    runs-on: ubuntu-latest
-    needs: lint
-    outputs:
-      image_tag: ${{ steps.meta.outputs.image_tag }}
-      image_uri: ${{ steps.meta.outputs.image_uri }}
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - name: Filesystem Scan
 
-      - name: Clone RAG Application Source
-        run: bash application/scripts/clone-rag.sh
+        uses: aquasecurity/trivy-action@0.28.0
 
-      - name: Configure AWS Credentials via OIDC
-        uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/github-actions-ecr-role
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Set Image Metadata
-        id: meta
-        run: |
-          IMAGE_TAG=${{ github.sha }}
-          IMAGE_URI=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${IMAGE_TAG}
-          echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
-          echo "image_uri=${IMAGE_URI}" >> $GITHUB_OUTPUT
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build Docker Image
-        uses: docker/build-push-action@v5
-        with:
-          context: ./app-source
-          file: ./app-source/Dockerfile
-          push: false
-          load: true
-          tags: ${{ steps.meta.outputs.image_uri }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Run Trivy Image Vulnerability Scan
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: ${{ steps.meta.outputs.image_uri }}
+          scan-type: fs
+          scan-ref: .
           format: sarif
-          output: trivy-image-results.sarif
-          severity: CRITICAL,HIGH
+          output: trivy-fs.sarif
+          severity: HIGH,CRITICAL
           exit-code: 0
 
-      - name: Upload Trivy SARIF to GitHub Security
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
+      - name: Upload Filesystem SARIF
+
+        if: always() && hashFiles('trivy-fs.sarif') != ''
+
+        uses: github/codeql-action/upload-sarif@v4
+
         with:
-          sarif_file: trivy-image-results.sarif
+          sarif_file:
+            trivy-fs.sarif
+            # ==========================================================
+  # BUILD + PUSH IMAGE
+  # ==========================================================
 
-      - name: Push Docker Image to ECR
-        run: docker push ${{ steps.meta.outputs.image_uri }}
+  build-image:
+    name: Build, Scan & Push Image
 
-  # ─────────────────────────────────────────
-  # STAGE 3: Update GitOps Manifests
-  # ─────────────────────────────────────────
-  gitops-update:
-    name: Update GitOps Manifests
     runs-on: ubuntu-latest
-    needs: build
-    if: github.ref == 'refs/heads/main'
+
+    needs:
+      - lint-security
+
+    timeout-minutes: 45
+
+    outputs:
+      image_uri: ${{ steps.meta.outputs.image_uri }}
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+
     steps:
-      - name: Checkout Repository
+      #########################################################
+      # Checkout
+      #########################################################
+
+      - name: Checkout CDS Repository
         uses: actions/checkout@v4
+
+      #########################################################
+      # Clone RAG Repository
+      #########################################################
+
+      - name: Clone RAG Repository
+        run: |
+          chmod +x application/scripts/clone-rag.sh
+          bash application/scripts/clone-rag.sh
+
+      #########################################################
+      # Validate Clone
+      #########################################################
+
+      - name: Validate Application Source
+
+        run: |
+
+          test -d app-source
+
+          test -f app-source/requirements.txt
+
+          echo "Application Files"
+
+          ls -lah app-source
+
+      #########################################################
+      # AWS Login
+      #########################################################
+
+      - name: Configure AWS Credentials
+
+        uses: aws-actions/configure-aws-credentials@v4
+
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/github-actions-ecr-role
+
+          aws-region: ${{ env.AWS_REGION }}
+
+      #########################################################
+      # ECR Login
+      #########################################################
+
+      - name: Login Amazon ECR
+
+        id: ecr
+
+        uses: aws-actions/amazon-ecr-login@v2
+
+      #########################################################
+      # Buildx
+      #########################################################
+
+      - name: Setup Docker Buildx
+
+        uses: docker/setup-buildx-action@v3
+
+      #########################################################
+      # Metadata
+      #########################################################
+
+      - name: Image Metadata
+
+        id: meta
+
+        run: |
+
+          IMAGE_URI=${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
+          echo "image_uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+
+          echo "image_tag=${{ github.sha }}" >> $GITHUB_OUTPUT
+
+          echo "IMAGE_URI=$IMAGE_URI"
+
+      #########################################################
+      # Docker Build
+      #########################################################
+
+      - name: Build Docker Image
+
+        uses: docker/build-push-action@v6
+
+        with:
+          context: ./app-source
+
+          file: ./application/Dockerfile
+
+          load: true
+
+          push: false
+
+          tags: |
+            ${{ steps.meta.outputs.image_uri }}
+
+          cache-from: type=gha
+
+          cache-to: type=gha,mode=max
+
+      #########################################################
+      # Verify Image
+      #########################################################
+
+      - name: Verify Docker Image
+
+        run: |
+
+          docker images
+
+          docker image inspect \
+          ${{ steps.meta.outputs.image_uri }}
+
+      #########################################################
+      # Push Image
+      #########################################################
+
+      - name: Push Docker Image
+
+        run: |
+
+          docker push \
+          ${{ steps.meta.outputs.image_uri }}
+
+      #########################################################
+      # Verify Push
+      #########################################################
+
+      - name: Verify Image in ECR
+
+        run: |
+
+          aws ecr describe-images \
+          --repository-name ${{ env.ECR_REPOSITORY }} \
+          --region ${{ env.AWS_REGION }}
+
+      #########################################################
+      # Trivy Image Scan
+      #########################################################
+
+      - name: Scan Docker Image
+
+        uses: aquasecurity/trivy-action@0.28.0
+
+        with:
+          image-ref: ${{ steps.meta.outputs.image_uri }}
+
+          format: sarif
+
+          output: trivy-image.sarif
+
+          severity: HIGH,CRITICAL
+
+          exit-code: 0
+
+      #########################################################
+      # Upload Scan
+      #########################################################
+
+      - name: Upload Image Scan
+
+        if: always() && hashFiles('trivy-image.sarif') != ''
+
+        uses: github/codeql-action/upload-sarif@v4
+
+        with:
+          sarif_file: trivy-image.sarif
+          # ==========================================================
+  # GITOPS UPDATE
+  # ==========================================================
+
+  gitops-update:
+    name: Update GitOps Repository
+
+    runs-on: ubuntu-latest
+
+    needs:
+      - build-image
+
+    if: github.ref == 'refs/heads/main'
+
+    permissions:
+      contents: write
+
+    steps:
+      #########################################################
+      # Checkout
+      #########################################################
+
+      - name: Checkout Repository
+
+        uses: actions/checkout@v4
+
         with:
           token: ${{ secrets.GITOPS_TOKEN }}
           fetch-depth: 0
 
-      - name: Update Image Tag in Deployment Manifest
-        run: |
-          IMAGE_URI=${{ needs.build.outputs.image_uri }}
-          sed -i "s|image:.*rag-document-qa:.*|          image: ${IMAGE_URI}|g" \
-            gitops-repo/applications/rag-document-qa/deployment.yaml
-          echo "Updated image to: ${IMAGE_URI}"
+      #########################################################
+      # Configure Git
+      #########################################################
 
-      - name: Commit & Push GitOps Changes
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add gitops-repo/applications/rag-document-qa/deployment.yaml
-          git diff --staged --quiet || \
-            git commit -m "chore: bump rag-document-qa image to ${{ needs.build.outputs.image_tag }} [skip ci]"
-          git push
+      - name: Configure Git
 
-  # ─────────────────────────────────────────
-  # STAGE 4: Deployment Summary
-  # ─────────────────────────────────────────
-  notify:
-    name: Deployment Summary
+        run: |
+
+          git config user.name github-actions[bot]
+
+          git config user.email github-actions[bot]@users.noreply.github.com
+
+      #########################################################
+      # Update Deployment Image
+      #########################################################
+
+      - name: Update Image
+
+        env:
+          IMAGE: ${{ needs.build-image.outputs.image_uri }}
+
+        run: |
+
+          FILE=gitops-repo/applications/rag-document-qa/deployment.yaml
+
+          test -f "$FILE"
+
+          sed -i \
+          "s|image:.*|        image: ${IMAGE}|g" \
+          "$FILE"
+
+          echo "Updated image"
+
+          grep image: "$FILE"
+
+      #########################################################
+      # Commit
+      #########################################################
+
+      - name: Commit Changes
+
+        run: |
+
+          git add gitops-repo
+
+          if git diff --cached --quiet
+          then
+
+            echo "No changes"
+
+          else
+
+            git commit \
+            -m "ci: deploy ${{ needs.build-image.outputs.image_tag }} [skip ci]"
+
+            git push
+
+          fi
+
+  # ==========================================================
+  # ARTIFACTS
+  # ==========================================================
+
+  artifacts:
+    name: Upload Build Artifacts
+
     runs-on: ubuntu-latest
-    needs: [build, gitops-update]
+
+    needs:
+      - build-image
+
     if: always()
+
     steps:
-      - name: Write Summary
+      - uses: actions/checkout@v4
+
+      - name: Upload Trivy SARIF
+
+        if: hashFiles('trivy-image.sarif') != ''
+
+        uses: actions/upload-artifact@v4
+
+        with:
+          name: trivy-image
+
+          path: trivy-image.sarif
+
+      - name: Upload Checkov SARIF
+
+        if: hashFiles('reports/checkov.sarif') != ''
+
+        uses: actions/upload-artifact@v4
+
+        with:
+          name: checkov
+
+          path: reports/checkov.sarif
+
+  # ==========================================================
+  # DEPLOYMENT SUMMARY
+  # ==========================================================
+
+  deployment-summary:
+    name: Deployment Summary
+
+    runs-on: ubuntu-latest
+
+    needs:
+      - build-image
+
+      - gitops-update
+
+    if: always()
+
+    steps:
+      - name: Summary
+
         run: |
-          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
-          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Image Tag | \`${{ needs.build.outputs.image_tag }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| GitOps Update | ${{ needs.gitops-update.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Triggered By | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Branch | ${{ github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
+
+          echo "# Enterprise DevSecOps Deployment" >> $GITHUB_STEP_SUMMARY
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "## Docker Image" >> $GITHUB_STEP_SUMMARY
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "\`${{ needs.build-image.outputs.image_uri }}\`" >> $GITHUB_STEP_SUMMARY
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "## Status" >> $GITHUB_STEP_SUMMARY
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "| Stage | Result |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+
+          echo "| Build | ${{ needs.build-image.result }} |" >> $GITHUB_STEP_SUMMARY
+
+          echo "| GitOps | ${{ needs.gitops-update.result }} |" >> $GITHUB_STEP_SUMMARY
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "Branch: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "Commit: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "Actor: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          # ==========================================================
+  # SBOM GENERATION
+  # ==========================================================
+
+  sbom:
+    name: Generate SBOM
+
+    runs-on: ubuntu-latest
+
+    needs:
+      - build-image
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Syft
+
+        uses: anchore/sbom-action/download-syft@v0
+
+      - name: Generate SBOM
+
+        run: |
+
+          syft \
+          ${{ needs.build-image.outputs.image_uri }} \
+          -o spdx-json \
+          > sbom.spdx.json
+
+      - name: Upload SBOM
+
+        uses: actions/upload-artifact@v4
+
+        with:
+          name: sbom
+
+          path: sbom.spdx.json
+
+  # ==========================================================
+  # IMAGE VERIFICATION
+  # ==========================================================
+
+  verify-image:
+    name: Verify Image Exists
+
+    runs-on: ubuntu-latest
+
+    needs:
+      - build-image
+
+    steps:
+      - name: Configure AWS
+
+        uses: aws-actions/configure-aws-credentials@v4
+
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-ecr-role
+
+          aws-region: ap-south-1
+
+      - name: Verify ECR
+
+        run: |
+
+          aws ecr describe-images \
+          --repository-name rag-document-qa \
+          --image-ids imageTag=${{ github.sha }}
+
+  # ==========================================================
+  # CLEANUP
+  # ==========================================================
+
+  cleanup:
+    name: Cleanup
+
+    runs-on: ubuntu-latest
+
+    needs:
+      - deployment-summary
+
+    if: always()
+
+    steps:
+      - name: Docker Cleanup
+
+        run: |
+
+          docker image prune -af || true
+
+          docker system prune -af || true
+
+  # ==========================================================
+  # FINAL RESULT
+  # ==========================================================
+
+  completed:
+    name: Pipeline Finished
+
+    runs-on: ubuntu-latest
+
+    needs:
+      - lint-security
+      - build-image
+      - gitops-update
+      - deployment-summary
+      - artifacts
+      - sbom
+      - verify-image
+
+    if: always()
+
+    steps:
+      - name: Final Status
+
+        run: |
+
+          echo ""
+
+          echo "==================================="
+
+          echo "Enterprise DevSecOps Pipeline"
+
+          echo "==================================="
+
+          echo ""
+
+          echo "Repository : ${{ github.repository }}"
+
+          echo "Branch     : ${{ github.ref_name }}"
+
+          echo "Commit     : ${{ github.sha }}"
+
+          echo ""
+
+          echo "Docker Image"
+
+          echo "${{ needs.build-image.outputs.image_uri }}"
+
+          echo ""
+
+          echo "Pipeline Complete"
+
+          echo ""
