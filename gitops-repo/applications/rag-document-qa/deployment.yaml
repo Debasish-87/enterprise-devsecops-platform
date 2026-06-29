@@ -1,0 +1,113 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+
+metadata:
+  name: rag-document-qa
+  namespace: rag
+  labels:
+    app: rag-document-qa
+    version: "1.0"
+
+spec:
+  replicas: 2
+
+  selector:
+    matchLabels:
+      app: rag-document-qa
+
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+
+  template:
+
+    metadata:
+      labels:
+        app: rag-document-qa
+
+    spec:
+      # Security: Do not use default service account
+      automountServiceAccountToken: false
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 2000
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: rag-document-qa
+          image: 409837635702.dkr.ecr.ap-south-1.amazonaws.com/rag-document-qa:latest
+
+          imagePullPolicy: Always
+
+          ports:
+            - containerPort: 8000
+              name: http
+              protocol: TCP
+
+          env:
+            - name: PORT
+              value: "8000"
+
+            - name: GEMINI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: rag-secret
+                  key: GEMINI_API_KEY
+
+            - name: API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: rag-secret
+                  key: API_TOKEN
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: tmp
+          emptyDir: {}
+
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: rag-document-qa

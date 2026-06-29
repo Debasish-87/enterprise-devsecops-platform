@@ -1,0 +1,52 @@
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+
+metadata:
+  name: falco
+  namespace: argocd
+
+spec:
+  project: default
+
+  source:
+    repoURL: https://falcosecurity.github.io/charts
+    chart: falco
+    targetRevision: 4.19.0
+
+    helm:
+      values: |
+        falco:
+          jsonOutput: true
+          jsonIncludeOutputProperty: true
+
+          grpc:
+            enabled: true
+
+          grpcOutput:
+            enabled: true
+
+        driver:
+          kind: modern_ebpf
+
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+
+        falcosidekick:
+          enabled: false  # Enable and configure for alerting
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: falco
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

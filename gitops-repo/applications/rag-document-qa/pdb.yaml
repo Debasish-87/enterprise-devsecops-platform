@@ -1,0 +1,13 @@
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+
+metadata:
+  name: rag-document-qa-pdb
+  namespace: rag
+
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: rag-document-qa

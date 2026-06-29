@@ -1,0 +1,27 @@
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+
+metadata:
+  name: rag-document-qa
+  namespace: argocd
+
+spec:
+  project: default
+
+  source:
+    repoURL: https://github.com/Debasish-87/enterprise-devsecops-platform.git
+    targetRevision: HEAD
+    path: gitops-repo/applications/rag-document-qa
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: rag
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - PrunePropagationPolicy=foreground
